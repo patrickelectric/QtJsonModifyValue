@@ -1,172 +1,278 @@
 #include "json.h"
 
-bool Json::debugMode = false;
-
-void Json::setDebugMode(bool debugMode) {
-    Json::debugMode = debugMode;
+Json::Json(bool debugMode, bool strictMode)
+{
+    this->debugMode = debugMode;
+    this->strictMode = strictMode;
 }
 
-bool Json::modifyJsonValue(QJsonValue &destValue, const QString &path, const QJsonValue &newValue) {
-    const int indexOfDot = path.indexOf('.');
-    const QString dotPropertyName = path.left(indexOfDot); // whole path before first dot
-    const QString dotSubPath = indexOfDot > 0 ? path.mid(indexOfDot + 1) : QString(); // whole path after first dot
+void Json::setDebugMode(bool debugMode)
+{
+    this->debugMode = debugMode;
+}
 
-    const int indexOfSquareBracketOpen = path.indexOf('[');
-    const int indexOfSquareBracketClose = path.indexOf(']');
+void Json::setStrictMode(bool strictMode)
+{
+    this->strictMode = strictMode;
+}
 
-    bool ok;
-    const int arrayIndex = path.mid(indexOfSquareBracketOpen + 1, indexOfSquareBracketClose - indexOfSquareBracketOpen - 1).toInt(&ok);
-    if (indexOfSquareBracketClose > 0 && !ok) {
-        if (debugMode) {
-            qDebug() << "Wrong array index:" << path.mid(indexOfSquareBracketOpen, indexOfSquareBracketClose - indexOfSquareBracketOpen + 1);
+QList<QVariant> Json::createPathParts(const QString &path)
+{
+    QRegularExpression rx("([^\\[\\]\\.\\\\]|\\\\\\\\|\\\\\\[|\\\\\\]|\\\\\\.)+|\\.\\."); // regex to find parts with escape sequences
+    QRegularExpressionMatchIterator it = rx.globalMatch(path);
+
+    QList<QVariant> pathParts; // parts of path
+    while (it.hasNext()) {
+        QRegularExpressionMatch match = it.next();
+        int prev = match.capturedStart() - 1; // index of char before part
+        int next = match.capturedEnd(); // index of char after part
+
+        bool pathPartIsObject; // if part of path is array or object
+
+        if (0 <= prev && next < path.size() && path[prev] == '[' && path[next] == ']') // if part is array
+            pathPartIsObject = false;
+        else if (((prev == -1 || path[prev] == ']' || path[prev] == '.') && (next == path.size() || path[next] == '.' || path[next] == '[')) || match.captured() == "..") // if part is object
+            pathPartIsObject = true;
+        else { // error in path
+            if (debugMode) {
+                qDebug() << "Critical error in path near:" << path.mid(prev + 1, next - prev - 1);
+            }
+            return QList<QVariant>() << QVariant();
         }
+
+        bool ok = true;
+
+        if (pathPartIsObject)
+            pathParts.append(match.captured().replace("..", "").replace("\\\\", "\\").replace("\\[", "[").replace("\\]", "]").replace("\\.", ".")); // insert part into list as object key and remove escape sequences
+        else
+            pathParts.append(match.captured().toInt(&ok)); // insert part into list as array index and check if index is valid
+
+        if (!ok) { // if array index is invalid
+            if (debugMode) {
+                qDebug() << "Requested array index is invalid number:" << path.mid(prev, next - prev + 1);
+            }
+            return QList<QVariant>() << QVariant();
+        }
+    }
+
+    return pathParts;
+}
+
+QList<QJsonValue> Json::getSubPathValues(const QJsonValue &val, const QList<QVariant> &pathParts, const bool &strictMode)
+{
+    QList<QJsonValue> values; // all sub values in path
+
+    values.append(val); // add root element(value)
+
+    for (int i = 0; i < pathParts.size(); ++i) { // expand whole subpath
+        QVariant part = pathParts.at(i);
+
+        QJsonValue lastVal = values.last();
+        if (part.type() == static_cast<int>(QMetaType::QString))
+            if (lastVal.isObject()) {
+                values.append(lastVal.toObject().value(part.toString()));
+            } else if (lastVal.isUndefined() && !strictMode) {
+                values.replace(values.size() - 1, QJsonObject());
+                values.append(values.last().toObject().value(part.toString()));
+            } else {
+                if (debugMode) {
+                    qDebug() << "You have requested Json object:" << part.toString();
+                    qDebug() << "But current QJsonValue is not object:" << lastVal;
+                }
+                return QList<QJsonValue>();
+            }
+        else
+            if (lastVal.isArray()) {
+                QJsonArray lastValArr = lastVal.toArray();
+                for (int j = lastValArr.size(); j < part.toInt(); ++j) {
+                    lastValArr.append(QJsonValue());
+                }
+                values.replace(values.size() - 1, lastValArr);
+                values.append(values.last().toArray().at(part.toInt()));
+            } else if (lastVal.isUndefined() && !strictMode) {
+                values.replace(values.size() - 1,QJsonArray());
+                QJsonArray lastValArr = lastVal.toArray();
+                for (int j = lastValArr.size(); j < part.toInt(); ++j) {
+                    lastValArr.append(QJsonValue());
+                }
+                values.replace(values.size() - 1, lastValArr);
+                values.append(values.last().toArray().at(part.toInt()));
+            } else {
+                if (debugMode) {
+                    qDebug() << "You have requested Json array with index:" << "[" + part.toString() + "]";
+                    qDebug() << "But current QJsonValue is not array:" << lastVal;
+                }
+                return QList<QJsonValue>();
+            }
+    }
+
+    if (strictMode && values.last().isUndefined()) {
+        if (debugMode) {
+            if (pathParts.last().type() == static_cast<int>(QMetaType::QString)) {
+                qDebug() << "You are trying to create new key-value:" << pathParts.last().toString();
+                qDebug() << "while in strict mode inside of object:" << values.at(values.size() - 2);
+            } else {
+                qDebug() << "You are trying to create new array index:" << "[" + pathParts.last().toString() + "]";
+                qDebug() << "while in strict mode inside of array:" << values.at(values.size() - 2);
+            }
+        }
+        return QList<QJsonValue>();
+    }
+
+    return values;
+}
+
+QJsonValue Json::joinSubPathValues(QList<QJsonValue> values, const QList<QVariant> &pathParts)
+{
+    for (int i = pathParts.count() - 1; i >= 0; --i) { // assign back subpath
+        QJsonValue lastVal = values.last();
+        values.removeLast();
+
+        QVariant part = pathParts.at(i);
+
+        if (part.type() == static_cast<int>(QMetaType::QString)) {
+            QJsonObject updateVal = values.last().toObject();
+            if (lastVal.isUndefined()) {
+                updateVal.remove(part.toString());
+            } else {
+                updateVal.insert(part.toString(), lastVal);
+            }
+            values.removeLast();
+            values.append(updateVal);
+        } else {
+            QJsonArray updateVal = values.last().toArray();
+            if (lastVal.isUndefined()) {
+                updateVal.removeAt(part.toInt());
+            } else {
+                updateVal.removeAt(part.toInt());
+                updateVal.insert(part.toInt(), lastVal);
+            }
+            values.removeLast();
+            values.append(updateVal);
+        }
+    }
+
+    return values.first(); // assign new root element(value)
+}
+
+bool Json::create(QJsonDocument *doc, const QString &path, const QJsonValue &newValue)
+{
+    QJsonValue val;
+    if (doc->isArray())
+        val = doc->array();
+    else if (doc->isObject())
+        val = doc->object();
+    else
+        return false;
+
+    bool returnValue = create(&val, path, newValue);
+
+    if (val.isArray())
+        doc->setArray(val.toArray());
+    else if (val.isObject())
+        doc->setObject(val.toObject());
+    else
+        return false;
+
+    return returnValue;
+}
+
+bool Json::create(QJsonValue *val, const QString &path, const QJsonValue &newValue)
+{
+    QList<QVariant> pathParts = createPathParts(path); // parts of path
+    if (pathParts.size() && !pathParts.at(0).isValid()) {
         return false;
     }
 
-    const QString squareBracketPropertyName = path.left(indexOfSquareBracketOpen); // whole path before first square bracket
-    const QString squareBracketSubPath = indexOfSquareBracketOpen > 0 ? path.mid(indexOfSquareBracketOpen) : path.mid(indexOfSquareBracketClose + 1).startsWith('.') ? path.mid(indexOfSquareBracketClose + 2) : path.mid(indexOfSquareBracketClose + 1); // whole path after squareBracketPropertyName
-
-    // determine what is first in path. dot or bracket
-    bool useDot = true;
-    if (indexOfDot >= 0) { // there is a dot in path
-        if (indexOfSquareBracketOpen >= 0) { // there is squarebracket in path
-            if (indexOfDot > indexOfSquareBracketOpen)
-                useDot = false; // square bracket is earlier, use it
-            else
-                useDot = true; // dot is earlier, use it
-        } else {
-            useDot = true; // there is no square bracket in path, use dot
-        }
-    } else { // there is no dot in path
-        if (indexOfSquareBracketOpen >= 0)
-            useDot = false; // there is square bracket in path, use it
-        else
-            useDot = true; // acutally, it doesn't matter, both dot and square bracket don't exist
+    QList<QJsonValue> values = getSubPathValues(*val, pathParts, false); // all sub values in path
+    if (values.isEmpty()) {
+        return false;
     }
 
-    QString usedPropertyName = useDot ? dotPropertyName : squareBracketPropertyName; // used property name for current operation, if is empty then the arrayIndex is used
-    QString usedSubPath = useDot ? dotSubPath : squareBracketSubPath; // remaining path to be used in next steps
+    values.removeLast(); // remove
+    values.append(newValue); // and assign new value
 
-    QJsonValue subValue; // subValue is value of the usedPropertyName or arrayIndex
-    if (destValue.isArray()) { // if current QJsonValue is array then usedPropertyName should be empty so the arrayIndex could be used
-        if (usedPropertyName.isEmpty()) {
-            QJsonArray destArray = destValue.toArray();
-            if (destArray.count() <= arrayIndex && !newValue.isUndefined()) { // if arrayIndex is higher than index of last element, fill array with null values to arrayIndex (without arrayIndex)
-                for (int i = destArray.count(); i < arrayIndex; ++i) {
-                    destArray.append(QJsonValue());
-                }
-                destValue = destArray;
-            }
-            subValue = destValue.toArray().at(arrayIndex);
-        } else { // if usedPropertyName is not empty, there is an error in requested path
-            if (debugMode) {
-                qDebug() << "Current QJqueryValue is Array:" << destValue;
-                qDebug() << "You requested JSON object with key:" << usedPropertyName;
-            }
-            return false;
-        }
-    } else if (destValue.isObject()) { // if current QJsonValue is object then usedPropertyName should not be emty
-        if (usedPropertyName.isEmpty()) { // if usedPropertyName is empty, there is an error in requested path
-            if (debugMode) {
-                qDebug() << "Current QJqueryValue is Object:" << destValue;
-                qDebug() << "You requested JSON array with key:" << path.mid(indexOfSquareBracketOpen, indexOfSquareBracketClose - indexOfSquareBracketOpen + 1);
-            }
-            return false;
-        } else {
-            subValue = destValue.toObject().value(usedPropertyName);
-        }
-    } else if (destValue.isUndefined()) { // if the sub value in path do not exist, create it
-        if (usedPropertyName.isEmpty()) {
-            destValue = QJsonArray();
-            QJsonArray destArray = destValue.toArray();
-            if (destArray.count() <= arrayIndex && !newValue.isUndefined()) { // if arrayIndex is higher than index of last element, fill array with null values to arrayIndex (without arrayIndex)
-                for (int i = destArray.count(); i < arrayIndex; ++i) {
-                    destArray.append(QJsonValue());
-                }
-                destValue = destArray;
-            }
-            subValue = destValue.toArray().at(arrayIndex);
-        } else {
-            destValue = QJsonObject();
-            subValue = destValue.toObject().value(usedPropertyName);
-        }
-    } else {
-        //this should never happen, it is already handled in previous function call in the if condition written on next few lines as return
-        return false; // but just for safety return
-    }
+    *val = joinSubPathValues(values, pathParts); // assign new root element(value)
 
-    bool returnValue = false;
+    return true;
+}
 
-    if (usedSubPath.isEmpty()) { // i am at the end of path, assign newValue
-        subValue = newValue;
-        returnValue = true;
-    } else {
-        if (subValue.isArray() || subValue.isObject()) { // is subValue is array or object continue deeper in path
-            returnValue = modifyJsonValue(subValue, usedSubPath, newValue);
-        } else if (subValue.isUndefined()) { // if subValue is undefined continue deeper in path only if am i assigning newValue
-            if (newValue.isUndefined()) { // if newValue is undefined i do not need to go deeper to remove key at path because the subpath does not exist
-                return false; // no need to delete value at requested path, the subpath does not exist
-            } else { // continue deeper in path and create all path keys until end
-                returnValue = modifyJsonValue(subValue, usedSubPath, newValue);
-            }
-        } else { // subValue is value and subPath is not empty, i cannot go deeper in requested pat, error
-            if (usedPropertyName.isEmpty()) {
-                if (debugMode) {
-                    qDebug() << "Current QJqueryValue is Value:" << subValue;
-                    qDebug() << "You requested JSON array with key:" << path.mid(indexOfSquareBracketOpen, indexOfSquareBracketClose - indexOfSquareBracketOpen + 1);
-                }
-                return false;
-            } else {
-                if (debugMode) {
-                    qDebug() << "Current QJqueryValue is Value:" << subValue;
-                    qDebug() << "You requested JSON object with key:" << usedPropertyName;
-                }
-                return false;
-            }
-        }
-    }
+bool Json::modify(QJsonDocument *doc, const QString &path, const QJsonValue &newValue)
+{
+    QJsonValue val;
+    if (doc->isArray())
+        val = doc->array();
+    else if (doc->isObject())
+        val = doc->object();
+    else
+        return false;
 
-    // assign subValue back into destValue based on destValue data type
-    if (destValue.isArray()) {
-        QJsonArray arr = destValue.toArray();
-        if (subValue.isUndefined()) { // delete
-            if (arr.size() > arrayIndex) {
-                arr.removeAt(arrayIndex);
-            }
-        } else { // assign
-            if (arr.size() > arrayIndex) {
-                arr.removeAt(arrayIndex);
-            }
-            arr.insert(arrayIndex, subValue);
-        }
-        destValue = arr;
-    } else if (destValue.isObject()) {
-        QJsonObject obj = destValue.toObject();
-        if (subValue.isUndefined()) // delete
-            obj.remove(usedPropertyName);
-        else // assign
-            obj.insert(usedPropertyName, subValue);
-        destValue = obj;
-    } else { // i am not exactly sure if this else statement is needed, i think that this should never happen, but just for safety i leave it here
-        destValue = newValue;
-    }
+    bool returnValue = modify(&val, path, newValue);
+
+    if (val.isArray())
+        doc->setArray(val.toArray());
+    else if (val.isObject())
+        doc->setObject(val.toObject());
+    else
+        return false;
 
     return returnValue;
 }
 
-bool Json::modifyJsonValue(QJsonDocument& doc, const QString& path, const QJsonValue& newValue) {
+bool Json::modify(QJsonValue *val, const QString &path, const QJsonValue &newValue)
+{
+    QList<QVariant> pathParts = createPathParts(path); // parts of path
+    if (pathParts.size() && !pathParts.at(0).isValid()) {
+        return false;
+    }
+
+    QList<QJsonValue> values = getSubPathValues(*val, pathParts, strictMode); // all sub values in path
+    if (values.isEmpty()) {
+        return false;
+    }
+
+    values.removeLast(); // remove
+    values.append(newValue); // and assign new value
+
+    *val = joinSubPathValues(values, pathParts); // assign new root element(value)
+
+    return true;
+}
+
+QJsonValue Json::get(const QJsonDocument &doc, const QString &path)
+{
     QJsonValue val;
     if (doc.isArray())
         val = doc.array();
-    else
+    else if (doc.isObject())
         val = doc.object();
-
-    bool returnValue = modifyJsonValue(val, path, newValue);
-
-    if (val.isArray())
-        doc = QJsonDocument(val.toArray());
     else
-        doc = QJsonDocument(val.toObject());
+        return QJsonValue(QJsonValue::Undefined);
 
-    return returnValue;
+    return get(val, path);
+}
+
+QJsonValue Json::get(const QJsonValue &val, const QString &path)
+{
+    QList<QVariant> pathParts = createPathParts(path); // parts of path
+    if (pathParts.size() && !pathParts.at(0).isValid()) {
+        return QJsonValue(QJsonValue::Undefined);
+    }
+
+    QList<QJsonValue> values = getSubPathValues(val, pathParts, true); // all sub values in path
+    if (values.isEmpty()) {
+        return QJsonValue(QJsonValue::Undefined);
+    }
+
+    return values.last();
+}
+
+bool Json::remove(QJsonDocument *doc, const QString &path)
+{
+    return modify(doc, path, QJsonValue(QJsonValue::Undefined));
+}
+
+bool Json::remove(QJsonValue *val, const QString &path)
+{
+    return modify(val, path, QJsonValue(QJsonValue::Undefined));
 }

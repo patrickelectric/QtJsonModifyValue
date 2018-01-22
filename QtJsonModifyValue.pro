@@ -14,3 +14,6 @@ SOURCES += main.cpp \
 
 HEADERS += \
     json.h
+
+DISTFILES += \
+    README.md
